@@ -1,9 +1,9 @@
 """
-VRAM Calculator Automation Script - Improved Version
+VRAM Calculator Automation Script - Final Version
 Automates data collection from https://apxml.com/tools/vram-calculator
 
 Uses undetected-chromedriver to bypass Cloudflare protection.
-Improved with placeholder-based selectors and proper React state triggering.
+Properly waits for dropdown options to appear before clicking.
 """
 
 import time
@@ -89,7 +89,7 @@ class VRAMCalculatorAutomation:
         return self.driver.execute_script(script)
     
     def switch_to_manual_mode(self):
-        """Switch input parameters from Slider to Manual mode using JavaScript"""
+        """Switch input parameters from Slider to Manual mode"""
         script = """
         (() => {
             // Find the toggle by looking for a label containing "Slider" or "Manual"
@@ -115,63 +115,86 @@ class VRAMCalculatorAutomation:
         time.sleep(OPERATION_DELAY)
         return "Manual" in str(result) or "Already" in str(result)
     
-    def select_dropdown_option(self, selector: str, option_text: str) -> bool:
-        """Select an option from a Mantine dropdown using JavaScript for reliability"""
-        script = f"""
-        (() => {{
-            const input = document.querySelector('{selector}');
-            if (!input) return "Input not found: {selector}";
-            
-            // Focus and clear the input
-            input.focus();
-            input.value = '';
-            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            
-            // Type the search text
-            input.value = '{option_text}';
-            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            
-            // Wait a bit for dropdown to appear
-            return "Typed: {option_text}";
-        }})()
+    def select_dropdown_option_with_retry(self, selector: str, option_text: str, max_retries: int = 3) -> bool:
         """
-        self.execute_js(script)
-        time.sleep(0.5)
+        Select an option from a dropdown with retries.
+        Uses a polling approach to wait for the dropdown options to appear.
+        """
+        for attempt in range(max_retries):
+            # First, focus and type into the input to filter options
+            type_script = f"""
+            (() => {{
+                const input = document.querySelector('{selector}');
+                if (!input) return {{ success: false, error: "Input not found" }};
+                
+                // Click to open dropdown, then clear and type
+                input.click();
+                input.focus();
+                input.select();
+                document.execCommand('delete');
+                document.execCommand('insertText', false, '{option_text}');
+                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                
+                return {{ success: true, typed: '{option_text}' }};
+            }})()
+            """
+            type_result = self.execute_js(type_script)
+            
+            if not type_result or not type_result.get("success"):
+                print(f"  Attempt {attempt+1}: Failed to type into dropdown")
+                continue
+            
+            # Wait for dropdown options to appear (polling)
+            for poll in range(10):  # Poll up to 10 times (0.1s each = 1s total)
+                time.sleep(0.1)
+                
+                # Check if matching option exists and click it
+                click_script = f"""
+                (() => {{
+                    const options = document.querySelectorAll('.mantine-Select-option, [role="option"]');
+                    for (const opt of options) {{
+                        const text = opt.textContent.trim();
+                        if (text.includes('{option_text}')) {{
+                            opt.click();
+                            return {{ success: true, selected: text }};
+                        }}
+                    }}
+                    return {{ success: false, optionCount: options.length }};
+                }})()
+                """
+                click_result = self.execute_js(click_script)
+                
+                if click_result and click_result.get("success"):
+                    time.sleep(OPERATION_DELAY)
+                    return True
+            
+            print(f"  Attempt {attempt+1}: Option '{option_text}' not found in dropdown")
+            time.sleep(0.3)
         
-        # Now click the matching option
-        click_script = f"""
-        (() => {{
-            const options = document.querySelectorAll('.mantine-Select-option, [role="option"]');
-            for (const opt of options) {{
-                if (opt.textContent.trim().includes('{option_text}')) {{
-                    opt.click();
-                    return "Selected: " + opt.textContent.trim();
-                }}
-            }}
-            return "Option not found: {option_text}";
-        }})()
-        """
-        result = self.execute_js(click_script)
-        time.sleep(OPERATION_DELAY)
-        return "Selected" in str(result)
+        print(f"  Failed to select '{option_text}' after {max_retries} attempts")
+        return False
     
     def select_model(self, model_name: str) -> bool:
         """Select a model from the model dropdown"""
-        return self.select_dropdown_option(self.SELECTORS["model"], model_name)
+        print(f"  Selecting model: {model_name}")
+        return self.select_dropdown_option_with_retry(self.SELECTORS["model"], model_name)
     
     def select_quantization(self, quantization: str) -> bool:
         """Select inference quantization"""
-        return self.select_dropdown_option(self.SELECTORS["quantization"], quantization)
+        print(f"  Selecting quantization: {quantization}")
+        return self.select_dropdown_option_with_retry(self.SELECTORS["quantization"], quantization)
     
     def select_kv_cache_quantization(self) -> bool:
         """Select KV Cache quantization (should always be FP16/BF16)"""
-        return self.select_dropdown_option(self.SELECTORS["kv_cache"], "FP16")
+        print(f"  Selecting KV Cache: FP16/BF16")
+        return self.select_dropdown_option_with_retry(self.SELECTORS["kv_cache"], "FP16")
     
     def select_hardware(self, hardware: str = "H200 (141GB)") -> bool:
         """Select hardware configuration"""
-        return self.select_dropdown_option(self.SELECTORS["hardware"], hardware)
+        print(f"  Selecting hardware: {hardware}")
+        return self.select_dropdown_option_with_retry(self.SELECTORS["hardware"], hardware)
     
-    def set_input_value_js(self, selector: str, value: int) -> bool:
+    def set_input_value_js(self, selector: str, value: int, field_name: str = "") -> bool:
         """
         Set a numeric input value using JavaScript with proper React state triggering.
         Uses document.execCommand('insertText') for reliable React state updates.
@@ -179,7 +202,7 @@ class VRAMCalculatorAutomation:
         script = f"""
         (() => {{
             const input = document.querySelector('{selector}');
-            if (!input) return "Input not found: {selector}";
+            if (!input) return {{ success: false, error: "Input not found: {selector}" }};
             
             // Focus the input
             input.focus();
@@ -187,7 +210,10 @@ class VRAMCalculatorAutomation:
             // Select all existing text
             input.select();
             
-            // Use execCommand to insert text (triggers React state properly)
+            // Delete existing content
+            document.execCommand('delete');
+            
+            // Use insertText to insert new value (triggers React state properly)
             document.execCommand('insertText', false, '{value}');
             
             // Dispatch events to ensure React picks up the change
@@ -197,48 +223,63 @@ class VRAMCalculatorAutomation:
             // Blur to finalize
             input.blur();
             
-            return "Set " + input.placeholder + " to " + input.value;
+            return {{ success: true, value: input.value }};
         }})()
         """
         result = self.execute_js(script)
         time.sleep(OPERATION_DELAY)
-        return "Set" in str(result)
+        
+        if result and result.get("success"):
+            return True
+        else:
+            print(f"  Failed to set {field_name}: {result}")
+            return False
     
     def set_batch_size(self, batch_size: int) -> bool:
         """Set the batch size"""
-        return self.set_input_value_js(self.SELECTORS["batch_size"], batch_size)
+        return self.set_input_value_js(self.SELECTORS["batch_size"], batch_size, "batch size")
     
     def set_sequence_length(self, length: int) -> bool:
         """Set the sequence length (context length)"""
-        return self.set_input_value_js(self.SELECTORS["sequence_length"], length)
+        return self.set_input_value_js(self.SELECTORS["sequence_length"], length, "sequence length")
     
     def set_concurrent_users(self, users: int) -> bool:
         """Set the number of concurrent users"""
-        return self.set_input_value_js(self.SELECTORS["concurrent_users"], users)
+        return self.set_input_value_js(self.SELECTORS["concurrent_users"], users, "concurrent users")
     
     def verify_configuration(self) -> Dict:
-        """Verify the current configuration by checking the summary line"""
+        """Verify the current configuration by checking the summary line and input values"""
         script = """
         (() => {
             const body = document.body.innerText;
             const batchMatch = body.match(/Batch:\\s*(\\d+)/);
             const usersMatch = body.match(/Users:\\s*(\\d+)/);
             
+            // Also check input values
+            const batchInput = document.querySelector('input[placeholder="Enter batch size"]');
+            const seqInput = document.querySelector('input[placeholder="Enter sequence length"]');
+            const usersInput = document.querySelector('input[placeholder="Enter number of concurrent users"]');
+            const modelInput = document.querySelector('input[placeholder="Choose a model"]');
+            
             return {
-                batch: batchMatch ? parseInt(batchMatch[1]) : null,
-                users: usersMatch ? parseInt(usersMatch[1]) : null
+                display_batch: batchMatch ? parseInt(batchMatch[1]) : null,
+                display_users: usersMatch ? parseInt(usersMatch[1]) : null,
+                input_batch: batchInput ? batchInput.value : null,
+                input_seq: seqInput ? seqInput.value : null,
+                input_users: usersInput ? usersInput.value : null,
+                input_model: modelInput ? modelInput.value : null
             };
         })()
         """
         return self.execute_js(script)
     
     def extract_results(self) -> Dict:
-        """Extract VRAM, throughput, and per-user speed from the results panel using JavaScript"""
+        """Extract VRAM, throughput, and per-user speed from the results panel"""
         time.sleep(RESULT_UPDATE_DELAY)
         
         script = """
         (() => {
-            // Find the results container
+            // Find the results container by looking for the header
             const findResultsHeader = () => {
                 const headers = document.querySelectorAll('p, h1, h2, h3, h4, span, div');
                 for (const h of headers) {
@@ -255,9 +296,7 @@ class VRAMCalculatorAutomation:
             
             // Extract VRAM - looking for the main VRAM display value
             // Pattern: "X.XX GB" or "X,XX GB" followed by "of Y GB VRAM"
-            const vramMatch = allText.match(/(\\d+[.,]\\d+)\\s*GB\\s*of\\s*\\d+/i) || 
-                              allText.match(/OKAY\\s*(\\d+[.,]\\d+)\\s*GB/i) ||
-                              allText.match(/(\\d+[.,]\\d+)\\s*GB/);
+            const vramMatch = allText.match(/(\\d+[.,]\\d+)\\s*GB\\s*of/i);
             
             // Extract Total Throughput
             const throughputMatch = allText.match(/Total Throughput:\\s*~?(\\d+(?:[.,]\\d+)?)\\s*tok\\/s/i);
@@ -270,13 +309,17 @@ class VRAMCalculatorAutomation:
             const batchMatch = allText.match(/Batch:\\s*(\\d+)/);
             const usersMatch = allText.match(/Users:\\s*(\\d+)/);
             
+            // Get the shared + per user breakdown
+            const breakdownMatch = allText.match(/(\\d+[.,]\\d+)\\s*GB\\s*shared\\s*\\+\\s*(\\d+[.,]\\d+)\\s*GB\\s*per\\s*user/i);
+            
             return {
                 vram_gb: vramMatch ? vramMatch[1].replace(',', '.') : null,
                 total_throughput: throughputMatch ? throughputMatch[1].replace(',', '.') : null,
                 per_user_speed: perUserMatch ? perUserMatch[1].replace(',', '.') : null,
                 verified_batch: batchMatch ? batchMatch[1] : null,
                 verified_users: usersMatch ? usersMatch[1] : null,
-                raw_text: allText.substring(0, 500)
+                shared_gb: breakdownMatch ? breakdownMatch[1].replace(',', '.') : null,
+                per_user_gb: breakdownMatch ? breakdownMatch[2].replace(',', '.') : null
             };
         })()
         """
@@ -311,34 +354,17 @@ class VRAMCalculatorAutomation:
     ) -> Optional[Dict]:
         """Collect data for a single configuration"""
         
-        print(f"\n--- Collecting: {model_display_name}, BS={batch_size}, CTX={context_label}, Users={concurrent_users} ---")
+        print(f"\n--- {model_display_name}, BS={batch_size}, CTX={context_label}, Users={concurrent_users} ---")
         
-        # Set all parameters
-        model_ok = self.select_model(model_site_name)
-        if not model_ok:
-            print(f"  Warning: Could not select model {model_site_name}")
-        
-        quant_ok = self.select_quantization(quantization)
-        if not quant_ok:
-            print(f"  Warning: Could not select quantization {quantization}")
-            
-        # Ensure KV Cache is FP16
-        kv_ok = self.select_kv_cache_quantization()
-        if not kv_ok:
-            print("  Warning: Could not set KV Cache to FP16")
+        # Set model and quantization
+        self.select_model(model_site_name)
+        self.select_quantization(quantization)
+        self.select_kv_cache_quantization()
         
         # Set input parameters
-        batch_ok = self.set_batch_size(batch_size)
-        if not batch_ok:
-            print(f"  Warning: Could not set batch size {batch_size}")
-            
-        seq_ok = self.set_sequence_length(context_length)
-        if not seq_ok:
-            print(f"  Warning: Could not set sequence length {context_length}")
-            
-        users_ok = self.set_concurrent_users(concurrent_users)
-        if not users_ok:
-            print(f"  Warning: Could not set concurrent users {concurrent_users}")
+        self.set_batch_size(batch_size)
+        self.set_sequence_length(context_length)
+        self.set_concurrent_users(concurrent_users)
         
         # Wait for results to update
         time.sleep(RESULT_UPDATE_DELAY)
@@ -346,7 +372,7 @@ class VRAMCalculatorAutomation:
         # Verify configuration was applied
         verification = self.verify_configuration()
         if verification:
-            print(f"  Verified: Batch={verification.get('batch')}, Users={verification.get('users')}")
+            print(f"  Config: Model='{verification.get('input_model')}', Batch={verification.get('display_batch')}, Users={verification.get('display_users')}")
         
         # Extract results
         extracted = self.extract_results()
@@ -362,7 +388,7 @@ class VRAMCalculatorAutomation:
             "Total Throughput (tok/s)": extracted["total_throughput"],
         }
         
-        print(f"  Results: VRAM={result['VRAM (GB)']} GB, Per-User={result['Tokens per User (tok/s)']} tok/s, Total={result['Total Throughput (tok/s)']} tok/s")
+        print(f"  => VRAM={result['VRAM (GB)']} GB, Per-User={result['Tokens per User (tok/s)']} tok/s, Total={result['Total Throughput (tok/s)']} tok/s")
         
         return result
     
@@ -404,7 +430,7 @@ class VRAMCalculatorAutomation:
                                 self.results.append(result)
                             
                             # Small delay between configurations
-                            time.sleep(0.3)
+                            time.sleep(0.2)
             
             print(f"\n\nCollection complete! Collected {len(self.results)} configurations.")
             
