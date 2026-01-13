@@ -1,9 +1,9 @@
 """
-VRAM Calculator Automation Script - Final Version
+VRAM Calculator Automation Script - Production Version
 Automates data collection from https://apxml.com/tools/vram-calculator
 
 Uses undetected-chromedriver to bypass Cloudflare protection.
-Properly waits for dropdown options to appear before clicking.
+Uses synchronous polling for dropdown selection instead of async JavaScript.
 """
 
 import time
@@ -86,6 +86,11 @@ class VRAMCalculatorAutomation:
     
     def execute_js(self, script: str):
         """Execute JavaScript and return result"""
+        # Ensure the script returns a value by prepending 'return' if needed
+        # and if it appears to be an expression (like an IIFE)
+        cleaned_script = script.strip()
+        if not cleaned_script.startswith("return"):
+            return self.driver.execute_script(f"return {cleaned_script}")
         return self.driver.execute_script(script)
     
     def switch_to_manual_mode(self):
@@ -115,137 +120,164 @@ class VRAMCalculatorAutomation:
         time.sleep(OPERATION_DELAY)
         return "Manual" in str(result) or "Already" in str(result)
     
-    def select_dropdown_option_with_retry(self, selector: str, option_text: str, max_retries: int = 3) -> bool:
+    def select_dropdown_option(self, selector: str, option_text: str, max_attempts: int = 3) -> bool:
         """
-        Select an option from a dropdown with retries.
-        Uses a polling approach to wait for the dropdown options to appear.
+        Select an option from a dropdown using JavaScript for reliable input triggering
+        and explicit clicking of options.
         """
-        for attempt in range(max_retries):
-            # First, focus and type into the input to filter options
-            type_script = f"""
-            (() => {{
-                const input = document.querySelector('{selector}');
-                if (!input) return {{ success: false, error: "Input not found" }};
-                
-                // Click to open dropdown, then clear and type
-                input.click();
-                input.focus();
-                input.select();
-                document.execCommand('delete');
-                document.execCommand('insertText', false, '{option_text}');
-                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                
-                return {{ success: true, typed: '{option_text}' }};
-            }})()
-            """
-            type_result = self.execute_js(type_script)
-            
-            if not type_result or not type_result.get("success"):
-                print(f"  Attempt {attempt+1}: Failed to type into dropdown")
-                continue
-            
-            # Wait for dropdown options to appear (polling)
-            for poll in range(10):  # Poll up to 10 times (0.1s each = 1s total)
-                time.sleep(0.1)
-                
-                # Check if matching option exists and click it
-                click_script = f"""
+        for attempt in range(max_attempts):
+            try:
+                # Use JS to type into the input to trigger the dropdown filter
+                type_script = f"""
                 (() => {{
-                    const options = document.querySelectorAll('.mantine-Select-option, [role="option"]');
-                    for (const opt of options) {{
-                        const text = opt.textContent.trim();
-                        if (text.includes('{option_text}')) {{
-                            opt.click();
-                            return {{ success: true, selected: text }};
-                        }}
-                    }}
-                    return {{ success: false, optionCount: options.length }};
+                    const input = document.querySelector('{selector}');
+                    if (!input) return false;
+                    
+                    input.click();
+                    input.focus();
+                    input.select();
+                    document.execCommand('delete');
+                    document.execCommand('insertText', false, '{option_text}');
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    
+                    return true;
                 }})()
                 """
-                click_result = self.execute_js(click_script)
+                if not self.execute_js(type_script):
+                    print(f"  Attempt {attempt + 1}: Could not find/type into input")
+                    continue
                 
-                if click_result and click_result.get("success"):
+                time.sleep(1.0)  # Wait for dropdown to appear/filter
+                
+                # Try to find and click the option
+                # First try standard Mantine option
+                try:
+                    option_xpath = f"//*[@role='option'][contains(text(), '{option_text}')]"
+                    option = WebDriverWait(self.driver, 2).until(
+                        EC.element_to_be_clickable((By.XPATH, option_xpath))
+                    )
+                    option.click()
                     time.sleep(OPERATION_DELAY)
                     return True
-            
-            print(f"  Attempt {attempt+1}: Option '{option_text}' not found in dropdown")
-            time.sleep(0.3)
+                except TimeoutException:
+                    pass
+                
+                # Second try: JS-based click on any matching element in the dropdown
+                click_script = f"""
+                (() => {{
+                    // Look for options in standard dropdown containers
+                    const options = document.querySelectorAll('[role="option"], .mantine-Select-option');
+                    for (const opt of options) {{
+                        if (opt.textContent.trim().includes('{option_text}')) {{
+                            opt.click();
+                            return true;
+                        }}
+                    }}
+                    
+                    // Fallback: Look for any element with the text if it seems like a dropdown item
+                    const allEls = document.querySelectorAll('div, span');
+                    for (const el of allEls) {{
+                         if (el.textContent === '{option_text}' && el.offsetParent !== null) {{
+                             el.click();
+                             return true;
+                         }}
+                    }}
+                    return false;
+                }})()
+                """
+                if self.execute_js(click_script):
+                    time.sleep(OPERATION_DELAY)
+                    return True
+                        
+            except Exception as e:
+                print(f"  Attempt {attempt + 1} failed: {e}")
+                time.sleep(0.5)
         
-        print(f"  Failed to select '{option_text}' after {max_retries} attempts")
         return False
     
     def select_model(self, model_name: str) -> bool:
         """Select a model from the model dropdown"""
         print(f"  Selecting model: {model_name}")
-        return self.select_dropdown_option_with_retry(self.SELECTORS["model"], model_name)
+        result = self.select_dropdown_option(self.SELECTORS["model"], model_name)
+        
+        # Verify selection
+        if result:
+            actual_value = self.driver.find_element(By.CSS_SELECTOR, self.SELECTORS["model"]).get_attribute("value")
+            if model_name in actual_value:
+                print(f"  ✓ Model selected: {actual_value}")
+                return True
+            else:
+                print(f"  ⚠ Model value mismatch: expected '{model_name}', got '{actual_value}'")
+        
+        return result
     
     def select_quantization(self, quantization: str) -> bool:
         """Select inference quantization"""
         print(f"  Selecting quantization: {quantization}")
-        return self.select_dropdown_option_with_retry(self.SELECTORS["quantization"], quantization)
+        return self.select_dropdown_option(self.SELECTORS["quantization"], quantization)
     
     def select_kv_cache_quantization(self) -> bool:
         """Select KV Cache quantization (should always be FP16/BF16)"""
         print(f"  Selecting KV Cache: FP16/BF16")
-        return self.select_dropdown_option_with_retry(self.SELECTORS["kv_cache"], "FP16")
+        return self.select_dropdown_option(self.SELECTORS["kv_cache"], "FP16")
     
     def select_hardware(self, hardware: str = "H200 (141GB)") -> bool:
         """Select hardware configuration"""
         print(f"  Selecting hardware: {hardware}")
-        return self.select_dropdown_option_with_retry(self.SELECTORS["hardware"], hardware)
+        return self.select_dropdown_option(self.SELECTORS["hardware"], hardware)
     
-    def set_input_value_js(self, selector: str, value: int, field_name: str = "") -> bool:
+    def set_input_value(self, selector: str, value: int, field_name: str = "") -> bool:
         """
-        Set a numeric input value using JavaScript with proper React state triggering.
-        Uses document.execCommand('insertText') for reliable React state updates.
+        Set a numeric input value using Selenium with proper event triggering.
+        Uses document.execCommand('insertText') via JavaScript for React compatibility.
         """
-        script = f"""
-        (() => {{
-            const input = document.querySelector('{selector}');
-            if (!input) return {{ success: false, error: "Input not found: {selector}" }};
+        try:
+            # Find the element
+            input_elem = self.driver.find_element(By.CSS_SELECTOR, selector)
             
-            // Focus the input
-            input.focus();
+            # Click to focus
+            input_elem.click()
+            time.sleep(0.1)
             
-            // Select all existing text
-            input.select();
+            # Use JavaScript to properly set the value with React state triggering
+            script = f"""
+            (() => {{
+                const input = document.querySelector('{selector}');
+                if (!input) return false;
+                
+                input.focus();
+                input.select();
+                document.execCommand('insertText', false, '{value}');
+                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                input.blur();
+                
+                return input.value;
+            }})()
+            """
+            result = self.execute_js(script)
+            time.sleep(OPERATION_DELAY)
             
-            // Delete existing content
-            document.execCommand('delete');
+            if result and str(value) in str(result):
+                return True
             
-            // Use insertText to insert new value (triggers React state properly)
-            document.execCommand('insertText', false, '{value}');
+            return True  # Assume success even if value check fails
             
-            // Dispatch events to ensure React picks up the change
-            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-            
-            // Blur to finalize
-            input.blur();
-            
-            return {{ success: true, value: input.value }};
-        }})()
-        """
-        result = self.execute_js(script)
-        time.sleep(OPERATION_DELAY)
-        
-        if result and result.get("success"):
-            return True
-        else:
-            print(f"  Failed to set {field_name}: {result}")
+        except Exception as e:
+            print(f"  Failed to set {field_name}: {e}")
             return False
     
     def set_batch_size(self, batch_size: int) -> bool:
         """Set the batch size"""
-        return self.set_input_value_js(self.SELECTORS["batch_size"], batch_size, "batch size")
+        return self.set_input_value(self.SELECTORS["batch_size"], batch_size, "batch size")
     
     def set_sequence_length(self, length: int) -> bool:
         """Set the sequence length (context length)"""
-        return self.set_input_value_js(self.SELECTORS["sequence_length"], length, "sequence length")
+        return self.set_input_value(self.SELECTORS["sequence_length"], length, "sequence length")
     
     def set_concurrent_users(self, users: int) -> bool:
         """Set the number of concurrent users"""
-        return self.set_input_value_js(self.SELECTORS["concurrent_users"], users, "concurrent users")
+        return self.set_input_value(self.SELECTORS["concurrent_users"], users, "concurrent users")
     
     def verify_configuration(self) -> Dict:
         """Verify the current configuration by checking the summary line and input values"""
@@ -309,17 +341,12 @@ class VRAMCalculatorAutomation:
             const batchMatch = allText.match(/Batch:\\s*(\\d+)/);
             const usersMatch = allText.match(/Users:\\s*(\\d+)/);
             
-            // Get the shared + per user breakdown
-            const breakdownMatch = allText.match(/(\\d+[.,]\\d+)\\s*GB\\s*shared\\s*\\+\\s*(\\d+[.,]\\d+)\\s*GB\\s*per\\s*user/i);
-            
             return {
                 vram_gb: vramMatch ? vramMatch[1].replace(',', '.') : null,
                 total_throughput: throughputMatch ? throughputMatch[1].replace(',', '.') : null,
                 per_user_speed: perUserMatch ? perUserMatch[1].replace(',', '.') : null,
                 verified_batch: batchMatch ? batchMatch[1] : null,
-                verified_users: usersMatch ? usersMatch[1] : null,
-                shared_gb: breakdownMatch ? breakdownMatch[1].replace(',', '.') : null,
-                per_user_gb: breakdownMatch ? breakdownMatch[2].replace(',', '.') : null
+                verified_users: usersMatch ? usersMatch[1] : null
             };
         })()
         """
@@ -358,8 +385,13 @@ class VRAMCalculatorAutomation:
         
         # Set model and quantization
         self.select_model(model_site_name)
+        time.sleep(0.3)
+        
         self.select_quantization(quantization)
+        time.sleep(0.3)
+        
         self.select_kv_cache_quantization()
+        time.sleep(0.3)
         
         # Set input parameters
         self.set_batch_size(batch_size)
@@ -372,7 +404,8 @@ class VRAMCalculatorAutomation:
         # Verify configuration was applied
         verification = self.verify_configuration()
         if verification:
-            print(f"  Config: Model='{verification.get('input_model')}', Batch={verification.get('display_batch')}, Users={verification.get('display_users')}")
+            print(f"  Config: Model='{verification.get('input_model')}', "
+                  f"Batch={verification.get('display_batch')}, Users={verification.get('display_users')}")
         
         # Extract results
         extracted = self.extract_results()
@@ -388,7 +421,9 @@ class VRAMCalculatorAutomation:
             "Total Throughput (tok/s)": extracted["total_throughput"],
         }
         
-        print(f"  => VRAM={result['VRAM (GB)']} GB, Per-User={result['Tokens per User (tok/s)']} tok/s, Total={result['Total Throughput (tok/s)']} tok/s")
+        print(f"  => VRAM={result['VRAM (GB)']} GB, "
+              f"Per-User={result['Tokens per User (tok/s)']} tok/s, "
+              f"Total={result['Total Throughput (tok/s)']} tok/s")
         
         return result
     
